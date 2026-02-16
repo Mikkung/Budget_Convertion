@@ -63,7 +63,6 @@ def read_excel_any(uploaded_file) -> pd.DataFrame:
     # default to openpyxl for xlsx
     return pd.read_excel(uploaded_file, header=None, engine="openpyxl")
 
-
 def convert_budget(uploaded_file, keep_suffix_in_budget_code: bool = True) -> pd.DataFrame:
     raw = read_excel_any(uploaded_file)
     year = extract_year(raw)
@@ -88,36 +87,46 @@ def convert_budget(uploaded_file, keep_suffix_in_budget_code: bool = True) -> pd
     if "Budget_Account" not in df.columns:
         raise KeyError("Could not find 'รหัสบัญชีงบประมาณ' / Budget_Account column after header set.")
 
-    # --- normalize text safely (keeps NA as NA)
+    # --- normalize text safely (keeps NA as NA, not "nan") ---
     s = (df["Budget_Account"]
          .astype("string")
          .str.replace("\u00A0", " ", regex=False)  # non-breaking space
          .str.strip()
     )
 
-    # --- group rows:
-    # examples:
-    #   G501 : something
-    #   G501_1 : something
-    #
-    # If keep_suffix_in_budget_code=True => Budget_Code = G501_1
-    # else => Budget_Code = G501
+    # --- 1) group แบบ Gxxx / Gxxx_suffix : type ---
+    # รองรับ: G501 : ...
+    #         G501_1 : ...
+    #         G501_12 : ...
+    #         G501_AB : ...
     if keep_suffix_in_budget_code:
-        group_pat = r"^((?:G\d{3})(?:_[^:\s]+)?)\s*:\s*(.+)$"
+        g_pat = r"^((?:G\d{3})(?:_[^:\s]+)?)\s*:\s*(.+)$"
     else:
-        group_pat = r"^(G\d{3})(?:_[^:\s]+)?\s*:\s*(.+)$"
+        # keep only base Gxxx as Budget_Code
+        g_pat = r"^(G\d{3})(?:_[^:\s]+)?\s*:\s*(.+)$"
 
-    m = s.str.extract(group_pat)  # col0=Budget_Code, col1=Budget_Type
-    is_group = m[0].notna()
+    m = s.str.extract(g_pat)  # m[0]=Budget_Code, m[1]=Budget_Type(after :)
+    is_g_group = m[0].notna()
 
-    df["Budget_Code"] = m[0].where(is_group).ffill()
-    df["Budget_Type"] = m[1].where(is_group).ffill()
+    # --- 2) group แบบ "ข้อความล้วน" (ไม่มีเลขนำหน้า และไม่ใช่ G-group) ---
+    starts_with_digit = s.str.match(r"^\d", na=False)
+    is_text_group = s.notna() & (s != "") & (~starts_with_digit) & (~is_g_group)
 
-    # Remove group rows by blanking Budget_Account then dropping NA
+    # --- Budget_Code: ตั้งจาก G-group เท่านั้น แล้ว ffill ---
+    df["Budget_Code"] = m[0].astype("string").where(is_g_group).ffill()
+
+    # --- Budget_Type: ถ้าเป็น G-group ใช้หลัง ":" / ถ้าเป็น text-group ใช้ทั้งบรรทัด แล้ว ffill ---
+    df["Budget_Type"] = pd.Series(pd.NA, index=df.index, dtype="string")
+    df.loc[is_g_group, "Budget_Type"] = m.loc[is_g_group, 1].astype("string")
+    df.loc[is_text_group, "Budget_Type"] = s.loc[is_text_group]
+    df["Budget_Type"] = df["Budget_Type"].ffill()
+
+    # --- mark group rows แล้วลบทิ้ง ---
+    is_group = is_g_group | is_text_group
     df["Budget_Account"] = s.where(~is_group)
     df = df.dropna(subset=["Budget_Account"]).reset_index(drop=True)
 
-    # --- split item rows: "5xx1 ค่านู่น ..." => Expense_Code + Expense_Detail
+    # --- split item line to Expense_Code / Expense_Detail ---
     ba = df["Budget_Account"].astype("string").str.strip()
     df["Expense_Code"] = ba.str.split().str[0]
     df["Expense_Detail"] = ba.str.split().str[1:].str.join(" ")
